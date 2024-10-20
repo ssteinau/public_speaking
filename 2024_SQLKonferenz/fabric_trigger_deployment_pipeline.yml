@@ -1,0 +1,538 @@
+
+trigger:
+  branches:
+    include:
+    - main
+  paths:
+    include:
+    - Compute/*
+    exclude:
+    - Storage/*
+    - Reports/*
+
+parameters:
+  - name: category
+    displayName: Category
+    type: string
+    default: Default
+    values:
+      - Default
+      - Compute
+      - Storage
+      - Reports
+
+jobs:
+- job: deploy_dev_to_test
+  displayName: Deploy Development to Test
+  pool:
+    name: <your-pool-name>
+
+  steps: 
+    - checkout: git://<your-project-name>/$(Build.Repository.Name)@$(Build.SourceBranchName)
+      displayName: Checkout Dev repository
+      persistCredentials: true
+      path: default
+
+    - task: PowerShell@2
+      displayName: Detect Category
+      inputs:
+        targetType: 'inline'
+        script: |
+          cd $(Agent.BuildDirectory)/default
+
+          git config user.name "<your-user-name>"
+          git config user.email "<your-user-email>"
+
+          git checkout main
+         
+
+          if('${{ parameters.category }}' -eq 'Default')
+          {
+            Write-Output "Default"
+            Write-Output $(Build.Repository.Name)
+
+            #git log --oneline
+
+            git diff --name-only HEAD HEAD~1
+
+            $item_category = git diff --name-only HEAD HEAD~1 | Select-String -Pattern "([a-zA-Z0-9]+)" | Select-Object -First 1 | ForEach-Object { $_.matches.groups[1].value }
+          } 
+          if('${{ parameters.category }}' -ne 'Default') 
+          {
+            Write-Output "Not default: ${{ parameters.category }}"
+            $item_category='${{ parameters.category }}'
+          }
+          Write-Output "Item category: $($item_category)"
+          echo "##vso[task.setvariable variable=item_category]$item_category"
+          cd $(Pipeline.Workspace)
+        pwsh: true
+
+    - task: AzureKeyVault@2
+      inputs:
+        azureSubscription: '<your-subscription-name>'
+        KeyVaultName: '<your-keyvault-name>'
+        SecretsFilter: '<your-secret-name-for-user-password>'
+        RunAsPreJob: false
+
+    - task: PowerShell@2
+      displayName: Login
+      inputs:
+        targetType: 'inline'
+        script: |
+          az login -u <your-user-email> -p $(<your-secret-name-for-user-password>) 
+        pwsh: true
+      
+    - task: PowerShell@2
+      displayName: Get Pipeline Id
+      inputs:
+        targetType: 'inline'
+        script: |
+          $pipeline_id = az rest `
+            --method GET `
+            --url https://api.fabric.microsoft.com/v1//deploymentPipelines `
+            --resource https://api.fabric.microsoft.com `
+            --query "value[?contains(displayName, `'$(item_category)`')].id | [0]"
+
+          $pipeline_id = $pipeline_id -replace '"',''
+          echo $pipeline_id
+          echo "##vso[task.setvariable variable=pipeline_id]$pipeline_id"
+        pwsh: true
+
+    - task: PowerShell@2
+      displayName: Get Stages Ids
+      inputs:
+        targetType: 'inline'
+        script: |
+          #Pipeline is assumed to have 3 stages dev,test,prod, in that order
+          $stages = az rest `
+            --method GET `
+            --url https://api.fabric.microsoft.com/v1/deploymentPipelines/$(pipeline_id)/stages `
+            --resource https://api.fabric.microsoft.com `
+            --query 'value[*]'
+
+          Write-Output $stages
+          $stages= $stages  | ConvertFrom-Json
+
+          $stage0 = ($stages | Where-Object{ $_.order -eq '0' } | Select-Object id).id
+          $stage1 = ($stages | Where-Object{ $_.order -eq '1' } | Select-Object id).id
+          $stage2 = ($stages | Where-Object{ $_.order -eq '2' } | Select-Object id).id
+
+          Write-Output "Stage 0: $stage0"
+          Write-Output "Stage 1: $stage1"
+          Write-Output "Stage 2: $stage2"
+          $stage0_workspaceId = ($stages | Where-Object{ $_.order -eq '0' } | Select-Object workspaceId).workspaceId
+          Write-Output "WorkspaceId 0: $stage0_workspaceId"
+          $stage1_workspaceId = ($stages | Where-Object{ $_.order -eq '1' } | Select-Object workspaceId).workspaceId
+          Write-Output "WorkspaceId 1: $stage1_workspaceId"
+          $stage2_workspaceId = ($stages | Where-Object{ $_.order -eq '2' } | Select-Object workspaceId).workspaceId
+          Write-Output "WorkspaceId 2: $stage2_workspaceId"
+          echo "##vso[task.setvariable variable=stage0]$stage0"
+          echo "##vso[task.setvariable variable=stage1]$stage1"
+          echo "##vso[task.setvariable variable=stage2]$stage2"
+          echo "##vso[task.setvariable variable=stage0_workspaceId]$stage0_workspaceId"
+          echo "##vso[task.setvariable variable=stage1_workspaceId]$stage1_workspaceId"
+          echo "##vso[task.setvariable variable=stage2_workspaceId]$stage2_workspaceId"
+        pwsh: true
+
+    - task: PowerShell@2
+      displayName: Sync source workspace with main branch
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Output "Stage 0 Workspace Id $(stage0_workspaceId)"
+ 
+          $status = az rest `
+            --method GET `
+            --url https://api.fabric.microsoft.com/v1/workspaces/$(stage0_workspaceId)/git/status `
+            --resource https://api.fabric.microsoft.com `
+            --query '{workspaceHead: workspaceHead, remoteCommitHash: remoteCommitHash}' 
+
+          Write-Output "Status: $status"
+
+          $status = $status | ConvertFrom-Json
+
+
+          $body = @"
+          {
+            "remoteCommitHash": "$($status.remoteCommitHash)",
+            "workspaceHead": "$($status.workspaceHead)",
+            "conflictResolution": {
+              "conflictResolutionType": "Workspace",
+              "conflictResolutionPolicy": "PreferRemote"
+            },
+            "options": {
+              "allowOverrideItems": true
+            }
+          }
+          "@
+
+          Write-Output "Request body: $body"
+
+          Write-Output https://api.fabric.microsoft.com/v1/workspaces/$stage0_workspaceId/git/updateFromGit
+          Write-Output https://api.fabric.microsoft.com/v1/workspaces/$(stage0_workspaceId)/git/updateFromGit
+
+          Start-Transcript -Path $(Pipeline.Workspace)/updateformgitresponse.txt
+
+          az rest `
+            --method POST `
+            --url https://api.fabric.microsoft.com/v1/workspaces/$(stage0_workspaceId)/git/updateFromGit `
+            --resource https://api.fabric.microsoft.com `
+            --body $body `
+            --verbose
+
+          Stop-Transcript
+
+          $http_response = Get-Content $(Pipeline.Workspace)/updateformgitresponse.txt
+          
+          Write-Output $http_response
+
+          $status_code = $http_response | Select-String -Pattern "Response\sstatus:\s([0-9]+)" | ForEach-Object { $_.Matches.Groups[1].Value } | Get-Unique
+          $poll_uri = $http_response | Select-String -Pattern "'Location':\s'(.*)'" | ForEach-Object { $_.Matches.Groups[1].Value } | Get-Unique
+          $retry_after = $http_response | Select-String -Pattern "'Retry-After':\s'([0-9]+)'" | ForEach-Object { $_.Matches.Groups[1].Value } | Get-Unique
+
+          $get_response_status = ""
+          if ($status_code -eq 202) {
+
+              while ($get_response_status.Replace('"','') -ne "Succeeded") {
+                  Write-Output "UpdateFromGit started. Polling URI: $poll_uri"
+
+                  Write-Output "Waiting for $retry_after seconds before polling"
+
+                  Start-Sleep $retry_after
+
+                  $get_response_status = az rest `
+                      --method GET `
+                      --url $poll_uri `
+                      --resource https://api.fabric.microsoft.com `
+                      --query 'status'
+
+                  Write-Output "Deployment Status: $get_response_status"
+
+                  if($get_response_status.Replace('"','') -eq "Failed") {
+                      Write-Output "UpdateFromGit failed."
+                      exit 1335
+                  }
+              }
+          }
+          elseif ($status_code -eq 200) {
+              Write-Output "Deployment succeeded. Status code: $status_code"
+          }
+          else {
+                  Write-Output "Deployment failed. Status code: $status_code"
+                  exit 1336
+          }
+        pwsh: true
+    - task: PowerShell@2
+      displayName: Trigger Fabric Deployment Pipeline
+      inputs:
+        targetType: 'inline'
+        script: |
+          $body = @"
+          {
+            "sourceStageId": "$(stage0)",
+            "targetStageId": "$(stage1)",
+            "note": "Deploying business ready items"
+          }
+          "@
+
+          Write-Output $body
+          
+          Start-Transcript -Path $(Pipeline.Workspace)/deployresponse.txt
+
+          az rest `
+            --method POST `
+            --url https://api.fabric.microsoft.com/v1/deploymentPipelines/$(pipeline_id)/deploy `
+            --resource https://api.fabric.microsoft.com `
+            --body $body `
+            --verbose
+
+          Stop-Transcript
+
+          $http_response = Get-Content $(Pipeline.Workspace)/deployresponse.txt
+
+          Write-Host "Recorded Transscript" -ForegoundColor Yellow
+          Write-Host $http_response -ForegoundColor Yellow
+
+          $status_code = $http_response | Select-String -Pattern "Response\sstatus:\s([0-9]+)" | ForEach-Object { $_.Matches.Groups[1].Value } | Get-Unique
+          $poll_uri = $http_response | Select-String -Pattern "'Location':\s'(.*)'" | ForEach-Object { $_.Matches.Groups[1].Value } | Get-Unique
+          $retry_after = $http_response | Select-String -Pattern "'Retry-After':\s'([0-9]+)'" | ForEach-Object { $_.Matches.Groups[1].Value } | Get-Unique
+
+          $get_response_status = ""
+          if ($status_code -eq 202) {
+
+              while ($get_response_status.Replace('"','') -ne "Succeeded") {
+                  Write-Output "Deployment started. Polling URI: $poll_uri"
+
+                  Write-Output "Waiting for $retry_after seconds before polling"
+
+                  Start-Sleep $retry_after
+
+                  $get_response_status = az rest `
+                      --method GET `
+                      --url $poll_uri `
+                      --resource https://api.fabric.microsoft.com `
+                      --query 'status'
+
+                  Write-Output "Deployment Status: $get_response_status"
+
+                  if($get_response_status.Replace('"','') -eq "Failed") {
+                      Write-Output "Deployment failed."
+                      exit 1337
+                  }
+              }
+          }
+          elseif ($status_code -eq 200) {
+              Write-Output "Deployment succeeded. Status code: $status_code"
+          }
+          else {
+                  Write-Output "Deployment failed. Status code: $status_code"
+                  exit 1338
+          }
+        pwsh: true
+
+    - task: PowerShell@2
+      displayName: Commit items of target workspace to Git
+      inputs:
+        targetType: 'inline'
+        script: |
+          $body = @"
+          {
+          "mode": "All",
+          "comment": "Automatically committed by Azure DevOps after Deployment Pipeline $item_category ran",
+          "note": "Committing business ready items"
+          }
+          "@
+
+          Start-Transcript -Path $(Pipeline.Workspace)/commitogitresponse.txt
+
+          az rest `
+            --method POST `
+            --url https://api.fabric.microsoft.com/v1/workspaces/$(stage1_workspaceId)/git/commitToGit `
+            --resource https://api.fabric.microsoft.com `
+            --body $body `
+            --verbose
+          
+          Stop-Transcript
+
+          $http_response = Get-Content $(Pipeline.Workspace)/commitogitresponse.txt
+          
+          Write-Output $http_response
+
+          $status_code = $http_response | Select-String -Pattern "Response\sstatus:\s([0-9]+)" | ForEach-Object { $_.Matches.Groups[1].Value } | Get-Unique
+          $poll_uri = $http_response | Select-String -Pattern "'Location':\s'(.*)'" | ForEach-Object { $_.Matches.Groups[1].Value } | Get-Unique
+          $retry_after = $http_response | Select-String -Pattern "'Retry-After':\s'([0-9]+)'" | ForEach-Object { $_.Matches.Groups[1].Value } | Get-Unique
+
+          $get_response_status = ""
+          if ($status_code -eq 202) {
+
+              while ($get_response_status.Replace('"','') -ne "Succeeded") {
+                  Write-Output "UpdateFromGit started. Polling URI: $poll_uri"
+
+                  Write-Output "Waiting for $retry_after seconds before polling"
+
+                  Start-Sleep $retry_after
+
+                  $get_response_status = az rest `
+                      --method GET `
+                      --url $poll_uri `
+                      --resource https://api.fabric.microsoft.com `
+                      --query 'status'
+
+                  Write-Output "Deployment Status: $get_response_status"
+
+                  if($get_response_status.Replace('"','') -eq "Failed") {
+                      Write-Output "UpdateFromGit failed."
+                      exit 1339
+                  }
+              }
+          }
+          elseif ($status_code -eq 200) {
+              Write-Output "Deployment succeeded. Status code: $status_code"
+          }
+          else {
+                  Write-Output "Deployment failed. Status code: $status_code"
+                  exit 1340
+          }
+        pwsh: true
+    
+    - checkout: git://<your-project-name>/<your-test-repository-name>@main
+      displayName: Checkout test git repository
+      persistCredentials: true
+      path: test_repo
+    
+    - task: PowerShell@2
+      displayName: Prepare repository for changes to commit
+      inputs:
+        targetType: 'inline'
+        script: |
+        
+          cd $(Agent.BuildDirectory)/test_repo
+
+          git config user.name "<your-user-name>"
+          git config user.email "<your-user-email>"
+
+          git checkout main
+
+          cd $(Pipeline.Workspace)
+        pwsh: true
+
+    - task: PowerShell@2
+      displayName: Adapt references from Dev To Test
+      inputs:
+        targetType: 'inline'
+        script: |
+          
+          $joined_workspaces = $( 
+              [PSCustomObject] @{ id = "$(stage0_workspaceId)"; displayName = "NYCTaxi_$(item_category)"; target_id = "$(stage1_workspaceId)"; }
+          )
+          $workspace_dev_items = az rest `
+              --method GET `
+              --url https://api.fabric.microsoft.com/v1/workspaces/$(stage0_workspaceId)/items `
+              --resource https://api.fabric.microsoft.com `
+              --query 'value' 
+          | ConvertFrom-Json
+
+          $workspace_test_items = az rest `
+              --method GET `
+              --url https://api.fabric.microsoft.com/v1/workspaces/$(stage1_workspaceId)/items `
+              --resource https://api.fabric.microsoft.com `
+              --query 'value' 
+          | ConvertFrom-Json
+
+          $joined_category_items = Join-Object -Left $workspace_dev_items -Right $workspace_test_items -LeftJoinProperty 'type', 'displayName' -RightJoinProperty 'type', 'displayName' `
+            -Type AllInBoth `
+            -LeftProperties 'id', 'displayName' -RightProperties 'id' `
+            -Prefix 'target_'
+
+          $joined_all = $($joined_workspaces,$joined_category_items)
+
+          $files = Get-ChildItem -Recurse -Path $(Agent.BuildDirectory)/test_repo -File -Exclude ".platform","*.md","*.ps1","*.yaml"
+
+          foreach($file in $files)
+          {
+              Write-Output $file.FullName
+              $content = Get-Content -Path $file.FullName
+              foreach($item in $joined_all)
+              {
+                  $content = $content.Replace($item.id, $item.target_id)    
+              }
+              #Otherwise empty lines are added to the end of the file which fabric does not like (most of the time)
+              $content = $content | Out-String
+              if($item_category -eq 'Notebooks' -and $file.FullName.Endswith('.json'))
+              {
+                Write-Host "Trimming json whitespace"
+                $content = $content.TrimEnd()
+              }
+              #$content = $content
+              Set-Content -Path $file.FullName -Value $content -NoNewline
+          }
+        pwsh: true 
+        
+    - task: PowerShell@2
+      displayName: Commit Repository with Translated Ids
+      inputs:
+        targetType: 'inline'
+        script: |
+        
+          cd $(Agent.BuildDirectory)/test_repo
+
+          git add -A .
+
+          git commit -m "Id Replaceplacement for Stage complete. Automatically committed by Azure DevOps after Deployment Pipeline $item_category ran"
+
+          git push
+          
+          cd $(Pipeline.Workspace)
+        pwsh: true
+
+    - task: PowerShell@2
+      displayName: Update Main Workspace
+      inputs:
+        targetType: 'inline'
+        script: |
+
+          $current_workspace_status = az rest `
+            --method GET `
+            --url https://api.fabric.microsoft.com/v1/workspaces/$(stage1_workspaceId)/git/status `
+            --resource https://api.fabric.microsoft.com `
+            --query '{ workspaceHead: workspaceHead, remoteCommitHash: remoteCommitHash }'    
+            | ConvertFrom-Json
+
+
+          Write-Host $current_workspace_status
+
+          $current_workspace_status2 = az rest `
+            --method GET `
+            --url https://api.fabric.microsoft.com/v1/workspaces/$(stage1_workspaceId)/git/status `
+            --resource https://api.fabric.microsoft.com `      
+            | ConvertFrom-Json
+
+          Write-Host $current_workspace_status2
+
+          $body = @"
+          {
+            "remoteCommitHash": "$($current_workspace_status.remoteCommitHash)",
+            "workspaceHead": "$($current_workspace_status.workspaceHead)",
+            "conflictResolution": {
+            "conflictResolutionType": "Workspace",
+            "conflictResolutionPolicy": "PreferRemote"
+            },
+            "options": {
+                "allowOverrideItems": true
+            }
+          }
+          "@
+
+          Write-Output $body
+
+          Start-Transcript -Path $(Pipeline.Workspace)/commitogitagainresponse.txt
+
+          az rest `
+              --method POST `
+              --url https://api.fabric.microsoft.com/v1/workspaces/$(stage1_workspaceId)/git/updateFromGit `
+              --resource https://api.fabric.microsoft.com `
+              --body $body `
+              --verbose
+
+          Stop-Transcript
+
+          $http_response = Get-Content $(Pipeline.Workspace)/commitogitagainresponse.txt
+          
+          Write-Output $http_response
+
+          $status_code = $http_response | Select-String -Pattern "Response\sstatus:\s([0-9]+)" | ForEach-Object { $_.Matches.Groups[1].Value } | Get-Unique
+          $poll_uri = $http_response | Select-String -Pattern "'Location':\s'(.*)'" | ForEach-Object { $_.Matches.Groups[1].Value } | Get-Unique
+          $retry_after = $http_response | Select-String -Pattern "'Retry-After':\s'([0-9]+)'" | ForEach-Object { $_.Matches.Groups[1].Value } | Get-Unique
+
+          $get_response_status = ""
+          if ($status_code -eq 202) {
+
+              while ($get_response_status.Replace('"','') -ne "Succeeded") {
+                  Write-Output "UpdateFromGit started. Polling URI: $poll_uri"
+
+                  Write-Output "Waiting for $retry_after seconds before polling"
+
+                  Start-Sleep $retry_after
+
+                  $get_response_status = az rest `
+                      --method GET `
+                      --url $poll_uri `
+                      --resource https://api.fabric.microsoft.com `
+                      --query 'status'
+
+                  Write-Output "Deployment Status: $get_response_status"
+
+                  if($get_response_status.Replace('"','') -eq "Failed") {
+                      Write-Output "UpdateFromGit failed."
+                      exit 1341
+                  }
+              }
+          }
+          elseif ($status_code -eq 200) {
+              Write-Output "Deployment succeeded. Status code: $status_code"
+          }
+          else {
+                  Write-Output "Deployment failed. Status code: $status_code"
+                  exit 1342
+          }
+        pwsh: true    

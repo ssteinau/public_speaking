@@ -1,0 +1,161 @@
+trigger:
+  branches:
+    include:
+    - main
+  paths:
+    include:
+    - Compute/*
+    exclude:
+    - Storage/*
+    - Reports/*
+
+
+jobs:
+- job: DeleteWorkspace 
+  pool:
+    name: <your pool-name>
+  steps:
+    - task: PowerShell@2
+      displayName: Outputs
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo $(Build.Repository.Name)
+          echo $(Build.SourceBranchName)
+        pwsh: true
+
+    # SourceBranchName will always be main for the time being
+    - checkout: self
+      clean: true
+      persistCredentials: true
+
+
+    - task: AzureKeyVault@2
+      inputs:
+        azureSubscription: '<your-subscription-name>'
+        KeyVaultName: '<your-keyvault-name>'
+        SecretsFilter: '<your-secret-name-for-user-password>'
+        RunAsPreJob: false
+
+    - task: PowerShell@2
+      displayName: Login
+      inputs:
+        targetType: 'inline'
+        script: |
+          az login -u <your-user-email> -p $(<your-secret-name-for-user-password>) 
+        pwsh: true
+      
+    - task: PowerShell@2
+      displayName: Get all branches
+      inputs:
+        targetType: 'inline'
+        script: |
+          git fetch --prune --all
+
+          $branches = git branch --list --all | ForEach-Object { $_ -split "`n" } | ForEach-Object { $_.replace('  remotes/origin/','').replace('* ','')} | Where-Object { -not $_.Contains('HEAD')}
+
+          Write-Output $branches
+          echo "##vso[task.setvariable variable=branches]$branches"
+        pwsh: true
+
+
+    - task: PowerShell@2
+      displayName: Get workspaces
+      inputs:
+        targetType: 'inline'
+        script: |
+          $workspaceIds = az rest `
+                              --method GET `
+                              --url https://api.fabric.microsoft.com/v1/admin/workspaces `
+                              --uri-parameters state=Active type=workspace `
+                              --resource https://api.fabric.microsoft.com `
+                              --query 'workspaces[*].id' | ConvertFrom-Json
+
+          Write-Output $workspaceIds
+          echo "##vso[task.setvariable variable=workspaceIds]$workspaceIds"
+        pwsh: true
+
+    - task: PowerShell@2
+      displayName: Find deleted branch and delete corresponding workspace
+      inputs:
+        targetType: 'inline'
+        script: |
+          #These are the workspaces that should not be considered for the search
+          #These are admin workspaces, the dev/test/prod workspaces, personal workspaces, etc
+          $exclusions = $('<workspace-id-guid-1>','<workspace-id-guid-2>','<workspace-id-guid-3>')
+          $body = @"
+          {
+            "emailAddress": "<your-user-email>",
+            "groupUserAccessRight": "Admin"
+          }
+          "@
+          $branchesArray = "$(branches)" | ForEach-Object { $_ -split " " }
+          $worspacesArray = "$(workspaceIds)" | ForEach-Object { $_ -split " " }
+          Write-Output $branchesArray
+          Write-Output $workspaceIds
+          foreach ($workspaceId in $worspacesArray)
+          {
+              if($exclusions.Contains($workspaceId))
+              {
+                Write-Output "Excluded workspace: $workspaceId"
+                continue
+              }
+
+
+              $hasAccess = az rest `
+              --method GET `
+              --url https://api.fabric.microsoft.com/v1/admin/workspaces/$workspaceId/users `
+              --resource https://api.fabric.microsoft.com `
+              --query 'accessDetails[*].principal.id' | 
+              ConvertFrom-Json |
+              Where-Object { $_.Replace('"','') -eq '65429990-9743-468f-99ec-cb3baab92a6e' } 
+
+              if($null -eq $hasAccess)
+              {
+
+                  Write-Output "Assuming control.."
+                  az rest `
+                    --method POST `
+                    --url https://api.powerbi.com/v1.0/myorg/admin/groups/$workspaceId/users `
+                    --resource https://api.fabric.microsoft.com `
+                    --body $body
+              }
+
+              Write-Output "Getting git connection"
+              $workspaceBranchName = az rest `
+                --method GET `
+                --url https://api.fabric.microsoft.com/v1/workspaces/$workspaceId/git/connection `
+                --resource https://api.fabric.microsoft.com `
+                --query 'gitProviderDetails.branchName'
+
+
+              if($null -eq $workspaceBranchName)
+              {
+                  Write-Output "Workspace $workspaceId has no git connection or user has insufficient privileges."
+                  continue
+              }
+
+              Write-Output "Workspace branch name $workspaceBranchName"
+
+              Write-Output "Workspace '$workspaceId' is connected to git branch '$workspaceBranchNameClean'" #>
+              $workspaceBranchNameClean = $workspaceBranchName.Replace('"','')
+
+              Write-Output "Cleaned Workspace Branch Name: $workspaceBranchNameClean"
+
+
+              if ( -not $branchesArray.Contains($workspaceBranchNameClean))
+              {
+                  Write-Output "Branch '$workspaceBranchNameClean' could not be found in remote repository."
+                  Write-Output "Deleting workspace $workspaceId"
+
+                  az rest `
+                  --method DELETE `
+                  --url https://api.fabric.microsoft.com/v1/workspaces/$workspaceId `
+                  --resource https://api.fabric.microsoft.com `
+
+
+                  Write-Output "Deleted workspace $workspaceId"
+                  break;
+              }
+          }
+        pwsh: true
